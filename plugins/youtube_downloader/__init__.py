@@ -25,6 +25,123 @@ QUALITY_FORMATS = {
 
 _SAFE_NAME = re.compile(r"[^\w\-. ]+", re.UNICODE)
 
+# Кэш результата проверки DNS (сбрасывается при каждой загрузке)
+_dns_probe = {}
+
+
+def resolve_yt_hosts() -> list:
+    """Резолвит хосты YouTube через все доступные источники.
+
+    Возвращает список уникальных IPv4-адресов; пустой список — если ни один
+    источник не ответил. Используется как обходной путь, когда системный DNS
+    возвращает getaddrinfo failed (битый/зависший резолвер Windows, hosts-файл,
+    блокировки провайдера).
+    """
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+    hosts = ["www.youtube.com", "www.google.com", "youtubei.googleapis.com"]
+    ips = []
+
+    def _add(addr):
+        if addr and addr.count(".") == 3 and addr not in ips:
+            ips.append(addr)
+
+    # 1) Системный DNS (обычный путь)
+    for h in hosts:
+        try:
+            for r in socket.getaddrinfo(h, 443, socket.AF_INET):
+                _add(r[4][0])
+        except OSError:
+            pass
+    if ips:
+        return ips
+
+    # 2) DoH через Google и Cloudflare параллельно — на случай зависания одного
+    import json as _json
+    import urllib.request
+
+    def _doh(server):
+        try:
+            req = urllib.request.Request(
+                f"https://dns.google/resolve?name={hosts[0]}&type=A",
+                headers={"User-Agent": "Mozilla/5.0"}, method="GET") if "dns.google" in server else None
+            if req is None:  # cloudflare-dns.com
+                req = urllib.request.Request(
+                    f"https://{server}/dns-query?name={hosts[0]}&type=A",
+                    headers={"Accept": "application/dns-json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = _json.loads(resp.read().decode())
+            return [a["data"] for a in data.get("Answer", []) if a.get("type") == 1]
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        for got in ex.map(_doh, ["https://dns.google/resolve", "cloudflare-dns.com"]):
+            for ip in got:
+                _add(ip)
+    return ips
+
+
+def _install_dns_shim():
+    """Подменяет разрешение имён в сокет-слое yt-dlp на кэш из resolve_yt_hosts().
+
+    yt-dlp вызывает socket.getaddrinfo напрямую только внутри networking/_helper.py,
+    поэтому точечная подмена безопасна: остальное приложение продолжает пользоваться
+    системным DNS. Хосты вида *.googlevideo.com (загрузка потоков) не подменяются.
+    """
+    global _dns_probe
+    if _dns_probe.get("installed"):
+        return
+    ips = resolve_yt_hosts()
+    if not ips:
+        raise RuntimeError(
+            "Не удалось определить IP-адреса YouTube: нет соединения с dns.google, "
+            "cloudflare-dns.com и youtube.com одновременно. Проверьте интернет/антивирус/VPN."
+        )
+    import yt_dlp.networking._helper as yth
+    orig = yth.socket.getaddrinfo
+
+    yt_set = {"www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com",
+              "www.google.com", "googleapis.com", "www.googleapis.com",
+              "oauth2.googleapis.com", "accounts.google.com", "content.googleapis.com",
+              "scone-pa.clients6.google.com", "clients6.google.com", "static.youtube.com",
+              "i.ytimg.com", "s.ytimg.com", "ytimg.com"}
+
+    def patched(host, port, family=0, type=0, proto=0, flags=0):
+        if host in yt_set:
+            out = []
+            for ip in ips:
+                if family in (0, __import__("socket").AF_INET) and type in (0, __import__("socket").SOCK_STREAM):
+                    out.append((__import__("socket").AF_INET, __import__("socket").SOCK_STREAM, proto or 6, "", (ip, port)))
+            if out:
+                return out
+        return orig(host, port, family, type, proto, flags)
+
+    import socket as _real_socket
+
+    class _ShimSocket:
+        """Прокси модуля socket: подменён только getaddrinfo, остальное — как в оригинале."""
+        def __getattr__(self, name):
+            return getattr(_real_socket, name)
+
+        def getaddrinfo(self, *a, **kw):
+            return patched(*a, **kw)
+
+    yth.socket = _ShimSocket()
+    _dns_probe = {"installed": True, "ips": ips}
+    log(f"YouTube: обход DNS — фиксированные адреса {', '.join(ips[:4])}")
+
+
+def _uninstall_dns_shim():
+    if _dns_probe.get("installed"):
+        try:
+            import yt_dlp.networking._helper as yth
+            import socket
+            yth.socket = socket
+        except Exception:
+            pass
+        _dns_probe.clear()
+
 
 def _safe_filename(name: str) -> str:
     """Убирает символы, недопустимые в именах файлов на Windows/Linux."""
@@ -270,18 +387,32 @@ class DownloadWorker(QThread):
                 opts["cookiesfrombrowser"] = ("chrome",)
 
             self.status_changed.emit("Получение информации о видео...")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-                title = _safe_filename(info.get("title", "video"))
-                for ext in ("mp4", "mkv", "webm"):
-                    candidate = os.path.join(self.out_dir, f"{title}.{ext}")
-                    if os.path.exists(candidate):
-                        final_path = candidate
-                        break
-                if not final_path:
-                    requested = info.get("requested_downloads") or []
-                    if requested:
-                        final_path = requested[0].get("filepath")
+            _uninstall_dns_shim()  # на случай остаточного состояния после прошлой загрузки
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=True)
+            except yt_dlp.utils.DownloadError as e:
+                # Ошибки сети/DNS (getaddrinfo failed и т.п.) обычно воспроизводятся
+                # повторно — пробуем один раз через DNS-over-HTTPS, минуя системный резолвер.
+                if not self._is_network_error(e):
+                    raise
+                log("YouTube: сетевая ошибка, повторяю с обходом системного DNS (DoH)...")
+                self.status_changed.emit("Сетевая ошибка — пробую обойти через DNS-over-HTTPS...")
+                _install_dns_shim()
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=True)
+            finally:
+                _uninstall_dns_shim()
+            title = _safe_filename(info.get("title", "video"))
+            for ext in ("mp4", "mkv", "webm"):
+                candidate = os.path.join(self.out_dir, f"{title}.{ext}")
+                if os.path.exists(candidate):
+                    final_path = candidate
+                    break
+            if not final_path:
+                requested = info.get("requested_downloads") or []
+                if requested:
+                    final_path = requested[0].get("filepath")
 
             if final_path and os.path.exists(final_path):
                 size_mb = os.path.getsize(final_path) / 1048576
@@ -292,19 +423,41 @@ class DownloadWorker(QThread):
                 self.failed.emit("Файл не найден после загрузки (неизвестная ошибка yt-dlp).")
 
         except Exception as e:
+            _uninstall_dns_shim()
             log_exception("YouTube: ошибка скачивания")
-            msg = str(e)[:500]
-            if "Sign in to confirm you're not a bot" in msg or "not a bot" in msg.lower():
-                msg += ("\nРешение: нажмите «Получить cookies из Chrome автоматически» в модуле — "
-                        "он сам достанет cookies из браузера. Либо включите «cookies из браузера» "
-                        "или укажите файл cookies.txt (расширение «Get cookies.txt LOCALLY»).")
-            elif "yt-dlp" in msg and "pip install" in msg.lower():
-                pass
+            msg = self._friendly_error(e)
             if final_path and os.path.exists(final_path):
                 # Скачали, но склейка упала — отдаём то, что есть
                 self.finished_ok.emit(final_path)
             else:
                 self.failed.emit(msg)
+
+    @staticmethod
+    def _is_network_error(e) -> bool:
+        s = str(e).lower()
+        return ("getaddrinfo" in s or "gaierror" in s or "temporary failure in name resolution" in s
+                or "name or service not known" in s or "network is unreachable" in s)
+
+    @classmethod
+    def _friendly_error(cls, e) -> str:
+        """Одно предложение вместо простыни трейсбека yt-dlp."""
+        raw = str(e)
+        low = raw.lower()
+        # Вытаскиваем главное сообщение ExtractorError/DownloadError, если оно есть
+        m = re.search(r"ERROR:\s*(.+?)(?:\n|$)", raw)
+        core = (m.group(1).strip() if m else raw.splitlines()[0])[:300]
+        if cls._is_network_error(e):
+            return ("Не удалось подключиться к YouTube: ошибка DNS (getaddrinfo failed), "
+                    "несмотря на автоматическую повторную попытку через DNS-over-HTTPS. "
+                    "Обычно это блокировка провайдера/антивируса или проблемы с интернетом. "
+                    "Что попробовать: 1) выключить VPN/прокси либо наоборот включить; "
+                    "2) временно отключить антивирус/файрвол; 3) проверить hosts-файл "
+                    "C:\\Windows\\System32\\drivers\\etc\\hosts (строки с youtube.com нужно удалить); "
+                    "4) сменить DNS адаптера на 8.8.8.8. ")
+        if "not a bot" in low:
+            return core + (" | Решение: нажмите «Получить cookies из Chrome автоматически» "
+                           "в модуле и повторите скачивание.")
+        return core
 
 
 class YouTubeDownloadPlugin(BasePlugin):
