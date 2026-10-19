@@ -8,5 +8,11 @@ faster-whisper>=1.0
 # Модуль "Загрузка с YouTube" (plugins/youtube_downloader)
 yt-dlp>=2025.1.15
 
+# Автоэкспорт cookies из Chrome (кнопка в модуле загрузки):
+#   pywin32 — только Windows (расшифровка мастер-ключа через DPAPI)
+#   pycryptodome — AES-GCM расшифровка значений cookies (все ОС)
+pycryptodome>=3.19
+pywin32>=306 ; sys_platform == "win32"
+
 # Опционально: ускорение загрузки cookies-обхода для yt-dlp
 # curl_cffi>=0.7

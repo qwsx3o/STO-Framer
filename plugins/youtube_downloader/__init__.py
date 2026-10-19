@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import subprocess
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFileDialog
 from PySide6.QtCore import QThread, Signal
@@ -29,6 +30,177 @@ def _safe_filename(name: str) -> str:
     """Убирает символы, недопустимые в именах файлов на Windows/Linux."""
     name = _SAFE_NAME.sub("_", name).strip(" ._")
     return name[:150] if name else "video"
+
+
+def chrome_cookie_db() -> str:
+    """Путь к базе cookies Chrome (или None, если не найдена)."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = []
+    if local:
+        # Обычный профиль и профиль с обфусцированным именем (GameDB / enterprise-сборки)
+        candidates.append(os.path.join(local, "Google", "Chrome", "User Data", "Default", "Cookies"))
+        prof_root = os.path.join(local, "Google", "Chrome", "User Data")
+        try:
+            for entry in os.listdir(prof_root):
+                p = os.path.join(prof_root, entry, "Default", "Cookies")
+                if os.path.isfile(p) and p not in candidates:
+                    candidates.append(p)
+        except OSError:
+            pass
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, ".config", "google-chrome", "Default", "Cookies"),
+        os.path.join(home, ".config", "chromium", "Default", "Cookies"),
+        os.path.join(home, "Library", "Application Support", "Google", "Chrome", "Default", "Cookies"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _chrome_master_key() -> bytes:
+    """AES-ключ Chrome из Local State. Windows: DPAPI; Linux: keyring/файл; macOS: ключ в связке."""
+    import base64, json
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [os.path.join(local, "Google", "Chrome", "User Data", "Local State")] if local else []
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, ".config", "google-chrome", "Local State"),
+        os.path.join(home, ".config", "chromium", "Local State"),
+        os.path.join(home, "Library", "Application Support", "Google", "Chrome", "Local State"),
+    ]
+    enc_key_b64 = None
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                enc_key_b64 = json.load(f)["os_crypt"]["encrypted_key"]
+            break
+        except (OSError, KeyError, ValueError):
+            continue
+    if not enc_key_b64:
+        raise RuntimeError("Не найден файл Local State с ключом шифрования Chrome")
+    raw = base64.b64decode(enc_key_b64)[5:]  # отбрасываем префикс "DPAPI"
+    if os.name == "nt":
+        try:
+            import win32crypt
+        except ImportError:
+            raise RuntimeError("Нужна библиотека pywin32: pip install pywin32")
+        return win32crypt.CryptUnprotectData(raw, None, None, None, 0)[1]
+    # Linux/macOS: browser_cookie3 умеет извлекать master key сам — сюда не доходим
+    raise RuntimeError("Мастер-ключ вне Windows не поддерживается напрямую")
+
+
+def _decrypt_chrome_values(rows: list) -> list:
+    """Расшифровка encrypted_value для строк cookie-базы Chrome.
+
+    rows: [(host_key, name, path, expires_utc, is_secure, encrypted_value), ...]
+    Возвращает список байтов-значений (пустые там, где расшифровать не удалось).
+    """
+    results = [b"" for _ in rows]
+    if os.name != "nt":
+        # Linux/macOS: пусть это сделает browser_cookie3 (keychain/keyring обвязка)
+        try:
+            import browser_cookie3
+            cj = browser_cookie3.chrome(domain_name="youtube.com")
+        except Exception as e:
+            raise RuntimeError(f"Не удалось прочитать cookies Chrome: {e}")
+        lookup = {(c.domain, c.name): (getattr(c, "value", "") or "").encode("utf-8", "replace")
+                  for c in cj}
+        for i, row in enumerate(rows):
+            results[i] = lookup.get((row[0], row[1]), b"")
+        if not any(results):
+            raise RuntimeError("Chrome вернул пустой набор cookies (закрыт профиль или нет авторизации на YouTube)")
+        return results
+
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        raise RuntimeError("Нужна библиотека pycryptodome: pip install pycryptodome")
+    key = _chrome_master_key()
+    for i, row in enumerate(rows):
+        blob = row[5] or b""
+        try:
+            if blob[:3] in (b"v10", b"v11", b"v20"):  # AES-GCM (Chrome 80+ / 127+)
+                nonce, payload = blob[3:15], blob[15:]
+                ct, tag = payload[:-16], payload[-16:]
+                results[i] = AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
+            elif os.name == "nt":  # старый DPAPI без префикса
+                import win32crypt
+                results[i] = win32crypt.CryptUnprotectData(blob, None, None, None, 0)[1]
+        except Exception:
+            results[i] = b""  # пропускаем нерасшифрованные (например, сервисные)
+    if not any(results):
+        raise RuntimeError("Не удалось расшифровать cookies Chrome (попробуйте экспорт через расширение Get Cookies.txt)")
+    return results
+
+
+def export_chrome_cookies(dest_path: str) -> int:
+    """Экспортирует cookies YouTube из базы Chrome в файл формата Netscape.
+
+    Читает SQLite напрямую (через копию файла — чтобы не мешал запущенный Chrome),
+    расшифровывает значения (Windows: master key + AES-GCM; Linux/macOS: browser_cookie3).
+    Возвращает количество сохранённых cookies; бросает RuntimeError с
+    человекочитаемым текстом, если что-то из шагов недоступно.
+    """
+    import sqlite3
+    db = chrome_cookie_db()
+    if not db:
+        raise RuntimeError("База cookies Chrome не найдена (убедитесь, что Chrome установлен)")
+
+    tmp = dest_path + ".tmpdb"
+    shutil.copy2(db, tmp)
+    try:
+        con = sqlite3.connect(tmp)
+        try:
+            rows = con.execute(
+                "SELECT host_key, name, path, expires_utc, is_secure, encrypted_value "
+                "FROM cookies WHERE host_key LIKE '%youtube.com%'").fetchall()
+        finally:
+            con.close()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    if not rows:
+        raise RuntimeError("В Chrome нет cookies youtube.com — откройте youtube.com и войдите в аккаунт")
+
+    values = _decrypt_chrome_values(rows)
+
+    with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Netscape HTTP Cookie File\n# exported by STO Framer Studio (YouTube module)\n\n")
+        for (host, name, path, exp, secure, _enc), val in zip(rows, values):
+            if not val:
+                continue
+            expiry = 0
+            if exp:  # WebKit time: мкс с 1601-01-01
+                try:
+                    expiry = max(0, int(exp / 1_000_000 - 11_644_473_600))
+                except (TypeError, ValueError):
+                    expiry = 0
+            # В Netscape-формате flag include_subdomains обязан соответствовать
+            # ведущей точке домена, иначе парсер (http.cookiejar у yt-dlp) падает.
+            initial_dot = host.startswith(".")
+            f.write(f"{host}\t{'TRUE' if initial_dot else 'FALSE'}\t{path or '/'}\t{'TRUE' if secure else 'FALSE'}"
+                    f"\t{expiry}\t{name}\t{val.decode('utf-8', 'replace')}\n")
+    return sum(1 for v in values if v)
+
+
+class CookieExportWorker(QThread):
+    """Экспорт cookies из Chrome вне потока GUI (чтение БД + расшифровка)."""
+    done = Signal(bool, str)  # успех, текст/путь
+
+    def run(self):
+        try:
+            dest = os.path.join(CACHE_DIR, "yt_cookies.txt")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            n = export_chrome_cookies(dest)
+            self.done.emit(True, f"{dest}|{n}")
+        except Exception as e:
+            log_exception(f"YouTube: экспорт cookies из Chrome не удался: {e}")
+            self.done.emit(False, str(e))
 
 
 class DownloadWorker(QThread):
@@ -123,8 +295,9 @@ class DownloadWorker(QThread):
             log_exception("YouTube: ошибка скачивания")
             msg = str(e)[:500]
             if "Sign in to confirm you're not a bot" in msg or "not a bot" in msg.lower():
-                msg += ("\nСовет: YouTube блокирует запросы без авторизации. Включите «cookies "
-                        "из браузера» или укажите файл cookies.txt (расширение Get Cookies.txt).")
+                msg += ("\nРешение: нажмите «Получить cookies из Chrome автоматически» в модуле — "
+                        "он сам достанет cookies из браузера. Либо включите «cookies из браузера» "
+                        "или укажите файл cookies.txt (расширение «Get cookies.txt LOCALLY»).")
             elif "yt-dlp" in msg and "pip install" in msg.lower():
                 pass
             if final_path and os.path.exists(final_path):
@@ -193,6 +366,12 @@ class YouTubeDownloadPlugin(BasePlugin):
         ck_box.addWidget(self.lbl_cookies, 1)
         layout.addLayout(ck_box)
 
+        # Автоэкспорт cookies прямо из базы Chrome — пользователю не нужно ничего ставить руками
+        self.btn_auto_cookies = PushButton("Получить cookies из Chrome автоматически", container)
+        self.btn_auto_cookies.setEnabled(False)
+        self.btn_auto_cookies.clicked.connect(self._auto_cookies)
+        layout.addWidget(self.btn_auto_cookies)
+
         btn_box = QHBoxLayout()
         self.btn_download = PrimaryPushButton("Скачать видео", container)
         self.btn_download.setEnabled(False)
@@ -224,10 +403,39 @@ class YouTubeDownloadPlugin(BasePlugin):
 
     def _set_inputs_enabled(self, free: bool):
         on = self.is_active and free
-        for w in (self.ed_url, self.combo_quality, self.chk_browser_cookies, self.btn_cookies):
+        for w in (self.ed_url, self.combo_quality, self.chk_browser_cookies,
+                  self.btn_cookies, self.btn_auto_cookies):
             w.setEnabled(on)
         self.btn_download.setEnabled(on)
         self.btn_cancel.setEnabled(not free and self.is_active)
+
+    def _auto_cookies(self):
+        """Фоновый экспорт cookies YouTube из базы Chrome + автотест загрузки."""
+        if getattr(self, "_ck_worker", None) and self._ck_worker.isRunning():
+            return
+        self.btn_auto_cookies.setEnabled(False)
+        self.lbl_status.setText("Экспорт cookies из Chrome...")
+        self._ck_worker = CookieExportWorker()
+        self._ck_worker.done.connect(self._on_cookies_done)
+        self._ck_worker.start()
+
+    def _on_cookies_done(self, ok: bool, payload: str):
+        self.btn_auto_cookies.setEnabled(self.is_active)
+        if ok:
+            path, n = payload.rsplit("|", 1)
+            self.cookies_file = path
+            self.lbl_cookies.setText(f"{os.path.basename(path)} ({n} шт., автоэкспорт)")
+            self.lbl_status.setText(
+                f"Cookies получены автоматически ({n} шт.). Попробуйте скачать видео ещё раз.")
+            InfoBar.success("Готово", f"Экспортировано cookies из Chrome: {n}",
+                            parent=self.ed_url, position=InfoBarPosition.TOP)
+        else:
+            self.lbl_status.setText(f"Автоэкспорт не удался: {payload}")
+            InfoBar.warning(
+                "Автоэкспорт недоступен",
+                "Скопируйте cookies вручную: откройте youtube.com в браузере и "
+                "используйте расширение «Get cookies.txt LOCALLY» → Сохранить → файл cookies.txt",
+                parent=self.ed_url, position=InfoBarPosition.TOP, duration=15000)
 
     def _pick_cookies(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -288,7 +496,19 @@ class YouTubeDownloadPlugin(BasePlugin):
         self.progress.setVisible(False)
         # Полная (неразмытая) версия ошибки — в статус-строке под полем ввода
         self.lbl_status.setText(f"Ошибка: {err}")
-        # Краткая однострочная версия — чтобы InfoBar/подсказка не обрезались до нечитаемости
+        # Человекочитаемое объяснение вместо сырого текста yt-dlp
+        low = str(err).lower()
+        if "not a bot" in low:
+            hint = ("YouTube требует подтверждения, что вы не бот. Нажмите «Получить cookies из Chrome "
+                    "автоматически» ниже (или в окне ошибки) и повторите скачивание.")
+        elif "video is private" in low or "sign in" in low and "bot" not in low:
+            hint = "Видео приватное или age-restricted — нужны cookies аккаунта, который имеет к нему доступ."
+        elif "unsupported url" in low:
+            hint = "Ссылка не распознана — проверьте, что это видео/плелист YouTube."
+        elif "cookie" in low and ("decrypt" in low or "safe storage" in low):
+            hint = "Не удалось прочитать cookies браузера — используйте автоэкспорт или файл cookies.txt."
+        else:
+            hint = ""
         short = " ".join(str(err).split())
         if len(short) > 200:
             short = short[:200] + "…"
@@ -297,10 +517,10 @@ class YouTubeDownloadPlugin(BasePlugin):
             first = first[:40].rstrip() + "…"
         bar = InfoBar.error(
             title="Скачивание не удалось",
-            content=short,
+            content=(hint if hint else short),
             parent=self.ed_url,
             position=InfoBarPosition.TOP,
-            duration=15000,
+            duration=-1 if hint else 15000,
         )
         # Если заголовок влезает целиком и отличается от тела — показываем его полностью
         try:
@@ -316,6 +536,15 @@ class YouTubeDownloadPlugin(BasePlugin):
             bar.addActionButton(PushButton("Подробности", bar), lambda: box.exec())
         except Exception:
             pass
+        # Если это антибот-блокировка — предлагаем автоматическое получение cookies из Chrome
+        if "not a bot" in str(err).lower():
+            def _autofix():
+                box.close()
+                self._auto_cookies()
+            try:
+                bar.addActionButton(PrimaryPushButton("Cookies из Chrome", bar), _autofix)
+            except Exception:
+                pass
 
     def _cleanup_worker(self):
         if self._worker:
