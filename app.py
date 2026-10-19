@@ -161,6 +161,7 @@ class StudioWindow(QWidget):
         # Модули
         self.plugin_manager = PluginManager()
         self.plugins = self.plugin_manager.reload_plugins()
+        self._wire_plugin_callbacks()
 
         # Дебаунс превью
         self._preview_timer = QTimer(self)
@@ -172,6 +173,19 @@ class StudioWindow(QWidget):
         log(f"Приложение запущено. Шрифтов: {len(self.font_files)}, плагинов: {len(self.plugins)}")
 
     # ------------------------------------------------------------------ темы / шрифты
+    def _wire_plugin_callbacks(self):
+        """Подключает колбэки модулей (например, автоподстановка скачанного видео)."""
+        for plugin in self.plugins:
+            if hasattr(plugin, "on_video_ready"):
+                plugin.on_video_ready = self._on_downloaded_video
+
+    def _on_downloaded_video(self, path: str):
+        """Модуль YouTube успешно скачал видео — делаем его исходным файлом нарезки."""
+        self.input_video = path
+        self.lbl_file.setText(f"{os.path.basename(path)} (скачано с YouTube)")
+        log(f"Скачанный файл подставлен как источник: {path}")
+        self._update_preview()
+
     def _apply_dark_theme(self):
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Window, QColor(32, 32, 32))
