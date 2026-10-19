@@ -1,0 +1,8 @@
+﻿.idea/
+cache/
+cache_preview.jpg
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.log
