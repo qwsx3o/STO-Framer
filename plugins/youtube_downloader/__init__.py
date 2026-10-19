@@ -286,9 +286,36 @@ class YouTubeDownloadPlugin(BasePlugin):
     def _on_failed(self, err):
         self._cleanup_worker()
         self.progress.setVisible(False)
+        # Полная (неразмытая) версия ошибки — в статус-строке под полем ввода
         self.lbl_status.setText(f"Ошибка: {err}")
-        InfoBar.error("Скачивание не удалось", err,
-                      parent=self.ed_url, position=InfoBarPosition.TOP, duration=-1)
+        # Краткая однострочная версия — чтобы InfoBar/подсказка не обрезались до нечитаемости
+        short = " ".join(str(err).split())
+        if len(short) > 200:
+            short = short[:200] + "…"
+        first = short.split(". ")[0].rstrip(".")
+        if len(first) >= 40:
+            first = first[:40].rstrip() + "…"
+        bar = InfoBar.error(
+            title="Скачивание не удалось",
+            content=short,
+            parent=self.ed_url,
+            position=InfoBarPosition.TOP,
+            duration=15000,
+        )
+        # Если заголовок влезает целиком и отличается от тела — показываем его полностью
+        try:
+            if first and first != short:
+                bar.title = first
+                bar.titleLabel.setText(first)
+        except Exception:
+            pass
+        # Кнопка с полным текстом ошибки (всплывающая подсказка обрезается, поэтому кнопка)
+        try:
+            from qfluentwidgets import MessageBox
+            box = MessageBox("Полный текст ошибки", str(err), self.ed_url.window())
+            bar.addActionButton(PushButton("Подробности", bar), lambda: box.exec())
+        except Exception:
+            pass
 
     def _cleanup_worker(self):
         if self._worker:
