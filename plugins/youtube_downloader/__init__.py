@@ -29,17 +29,61 @@ _SAFE_NAME = re.compile(r"[^\w\-. ]+", re.UNICODE)
 _dns_probe = {}
 
 
-def resolve_yt_hosts() -> list:
+def _doh_raw(server_ip: str, names) -> dict:
+    """DNS-over-HTTPS запрос напрямую к IP резолвера (минуя системный DNS целиком).
+
+    server_ip: "8.8.8.8" (Google DoH) или "1.1.1.1" (Cloudflare).
+    Возвращает {host: [ipv4,...]}; пустой dict — если сервер недоступен.
+    Имя хоста в SNI/сертификате не проверяется (IP вместо имени), но данные DNS
+    подписаны DNSSEC на стороне резолвера; используем два независимых источника.
+    """
+    import json as _json
+    import socket
+    import ssl
+    import http.client
+
+    out = {}
+    try:
+        ctx = ssl.create_default_context()
+        # соединяемся по IP, но сертификат Google/Cloudflare выдан на их домен
+        conn = http.client.HTTPSConnection(server_ip, 443, timeout=6, context=ctx)
+        conn.sock = socket.create_connection((server_ip, 443), timeout=6)
+        conn.sock = ctx.wrap_socket(conn.sock, server_hostname=(
+            "dns.google" if server_ip == "8.8.8.8" else "cloudflare-dns.com"))
+        for name in names:
+            path = (f"/resolve?name={name}&type=A" if server_ip == "8.8.8.8"
+                    else f"/dns-query?name={name}&type=A")
+            headers = {"Host": "dns.google" if server_ip == "8.8.8.8" else "cloudflare-dns.com",
+                       "Accept": "application/dns-json", "User-Agent": "Mozilla/5.0"}
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                data = _json.loads(resp.read().decode())
+                ips = [a["data"] for a in data.get("Answer", []) if a.get("type") == 1]
+                if ips:
+                    out[name] = ips
+            except Exception:
+                continue
+        try:
+            conn.close()
+        except Exception:
+            pass
+    except Exception:
+        return {}
+    return out
+
+
+def resolve_yt_hosts(hosts=None) -> list:
     """Резолвит хосты YouTube через все доступные источники.
 
-    Возвращает список уникальных IPv4-адресов; пустой список — если ни один
-    источник не ответил. Используется как обходной путь, когда системный DNS
-    возвращает getaddrinfo failed (битый/зависший резолвер Windows, hosts-файл,
-    блокировки провайдера).
+    Порядок: системный DNS (обычно работает — тогда DoH не нужен) → DoH через urllib
+    (если dns.google резолвится штатно) → DoH «в лоб» к IP 8.8.8.8/1.1.1.1 через raw TLS
+    (единственный путь, когда резолвер Windows мёртв полностью, ошибка 11001).
+    Возвращает список уникальных IPv4 для hosts (по умолчанию — www.youtube.com);
+    пустой список — если ни один источник не ответил.
     """
     import socket
-    from concurrent.futures import ThreadPoolExecutor
-    hosts = ["www.youtube.com", "www.google.com", "youtubei.googleapis.com"]
+    hosts = list(hosts or ["www.youtube.com"])
     ips = []
 
     def _add(addr):
@@ -56,7 +100,7 @@ def resolve_yt_hosts() -> list:
     if ips:
         return ips
 
-    # 2) DoH через Google и Cloudflare параллельно — на случай зависания одного
+    # 2) DoH через dns.google / cloudflare-dns.com обычным urllib-путём
     import json as _json
     import urllib.request
 
@@ -75,72 +119,155 @@ def resolve_yt_hosts() -> list:
         except Exception:
             return []
 
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as ex:
         for got in ex.map(_doh, ["https://dns.google/resolve", "cloudflare-dns.com"]):
             for ip in got:
                 _add(ip)
+    if ips:
+        return ips
+
+    # 3) ДоH по IP напрямую (8.8.8.8 и 1.1.1.1 параллельно) — обходит мёртвый резолвер
+    results = {}
+    def _raw(ip):
+        return _doh_raw(ip, hosts)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        for got in ex.map(_raw, ["8.8.8.8", "1.1.1.1"]):
+            for host, addrs in got.items():
+                results.setdefault(host, []).extend(addrs)
+    for host in hosts:
+        for ip in dict.fromkeys(results.get(host, [])):
+            _add(ip)
     return ips
 
 
-def _install_dns_shim():
-    """Подменяет разрешение имён в сокет-слое yt-dlp на кэш из resolve_yt_hosts().
+# Хосты YouTube/Google, которые нужно резолвить в обход системы. ВАЖНО: googlevideo.com
+# (CDN стримов) сюда НЕ входит — его резолвит система, а при битом DNS срабатывает
+# connect-хук, который сам попросит DoH для любого хоста, не указанного в IP.
+_YT_PIN_HOSTS = {"www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com",
+                 "www.youtube-nocookie.com", "youtubei.googleapis.com", "www.googleapis.com",
+                 "scone-pa.clients6.google.com", "manifest.googlevideo.com",
+                 "i.ytimg.com", "s.ytimg.com", "static.youtube.com"}
 
-    yt-dlp вызывает socket.getaddrinfo напрямую только внутри networking/_helper.py,
-    поэтому точечная подмена безопасна: остальное приложение продолжает пользоваться
-    системным DNS. Хосты вида *.googlevideo.com (загрузка потоков) не подменяются.
+_DNS_BLOCK_ERRNO = 11001  # Windows WSANOTINITIALISED... нет: EAI_NONAME — «имя не найдено»
+
+
+def _is_ip(s: str) -> bool:
+    import socket
+    try:
+        socket.inet_aton(str(s))
+        return True
+    except OSError:
+        return False
+
+
+def _install_dns_shim():
+    """Обход сломанного системного DNS для загрузок yt-dlp.
+
+    На машинах с Errno 11001 (getaddrinfo failed) резолвер Windows не отвечает НИКОМУ,
+    включая urllib, поэтому DoH-запросы к dns.google тоже падают. Решение — два уровня:
+
+    1) getaddrinfo: для известных хостов YouTube отдаём IP, полученные через DoH
+       (raw-TLS запрос к 8.8.8.8 минуется резолвер; если есть обычный интернет — берём
+       системный резолв). Если IP ещё нет — регистрируем хост в очередь и возвращаем
+       placeholder, чтобы соединение дошло до уровня connect.
+    2) socket.connect: любой hostname-адрес (например *.googlevideo.com или dns.google)
+       резолвится лениво тем же механизмом и подменяется на IP — так TLS/SNI продолжают
+       работать с настоящим именем сервера (yt-dlp оборачивает сокет с server_hostname=host).
+
+    Подмена глобальная, но живёт только на время загрузки (_uninstall_dns_shim в finally).
     """
     global _dns_probe
     if _dns_probe.get("installed"):
         return
-    ips = resolve_yt_hosts()
-    if not ips:
-        raise RuntimeError(
-            "Не удалось определить IP-адреса YouTube: нет соединения с dns.google, "
-            "cloudflare-dns.com и youtube.com одновременно. Проверьте интернет/антивирус/VPN."
-        )
-    import yt_dlp.networking._helper as yth
-    orig = yth.socket.getaddrinfo
+    import socket
 
-    yt_set = {"www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com",
-              "www.google.com", "googleapis.com", "www.googleapis.com",
-              "oauth2.googleapis.com", "accounts.google.com", "content.googleapis.com",
-              "scone-pa.clients6.google.com", "clients6.google.com", "static.youtube.com",
-              "i.ytimg.com", "s.ytimg.com", "ytimg.com"}
+    state = {"ips": {}, "pending": set(), "orig_gai": socket.getaddrinfo,
+             "orig_connect": socket.socket.connect, "resolving": False}
+    _dns_probe = {"installed": True, "state": state}
 
-    def patched(host, port, family=0, type=0, proto=0, flags=0):
-        if host in yt_set:
-            out = []
-            for ip in ips:
-                if family in (0, __import__("socket").AF_INET) and type in (0, __import__("socket").SOCK_STREAM):
-                    out.append((__import__("socket").AF_INET, __import__("socket").SOCK_STREAM, proto or 6, "", (ip, port)))
-            if out:
-                return out
-        return orig(host, port, family, type, proto, flags)
+    def _ensure_ips(host):
+        """IP для хоста: из кэша, иначе резолв (системный → DoH). Пустой список при неудаче."""
+        if host in state["ips"]:
+            return state["ips"][host]
+        if _is_ip(host):  # сам IP — резолв не нужен (иначе DoH-запросы к 8.8.8.8 зациклятся)
+            return [host]
+        ips = []
+        try:
+            for r in state["orig_gai"](host, 443, socket.AF_INET):
+                if r[4][0] not in ips:
+                    ips.append(r[4][0])
+        except OSError:
+            ips = []
+        if not ips and not state["resolving"]:
+            # resolving=True защищает от рекурсии: DoH-запросы внутри резолвят сами себя
+            state["resolving"] = True
+            try:
+                for ip in resolve_yt_hosts([host]):
+                    if ip not in ips:
+                        ips.append(ip)
+            finally:
+                state["resolving"] = False
+        if ips:
+            state["ips"][host] = ips
+        return ips
 
-    import socket as _real_socket
+    def gai_patched(host, port, family=0, type=0, proto=0, flags=0):
+        h = str(host)
+        if not _is_ip(h):
+            if h in _YT_PIN_HOSTS or state["resolving"]:
+                ips = _ensure_ips(h)
+                if ips:
+                    return [(socket.AF_INET, socket.SOCK_STREAM, proto or 6, "", (ip, port))
+                            for ip in ips]
+                # IP пока недоступен: placeholder нужен, чтобы код дошёл до connect,
+                # где хост будет зарезолвлен лениво (см. connect_patched)
+                return [(socket.AF_INET, socket.SOCK_STREAM, proto or 6, "", ("192.0.2.1", port))]
+            # Прочие имена (например googlevideo CDN) — пробуем системный резолвер;
+            # если он мёртв, исключение перехватит connect-уровень ниже по стеку? Нет —
+            # create_connection зовёт getaddrinfo ДО connect. Резолвим лениво и здесь.
+            ips = _ensure_ips(h)
+            if ips:
+                return [(socket.AF_INET, socket.SOCK_STREAM, proto or 6, "", (ip, port))
+                        for ip in ips]
+        return state["orig_gai"](host, port, family, type, proto, flags)
 
-    class _ShimSocket:
-        """Прокси модуля socket: подменён только getaddrinfo, остальное — как в оригинале."""
-        def __getattr__(self, name):
-            return getattr(_real_socket, name)
+    def connect_patched(self, addr, *a, **kw):
+        orig = state["orig_connect"]
+        try:
+            if isinstance(addr, tuple) and len(addr) >= 2 and not _is_ip(addr[0]):
+                host = str(addr[0])
+                ips = _ensure_ips(host)
+                if ips:
+                    addr = (ips[0], addr[1])
+            return orig(self, addr, *a, **kw)
+        except OSError as e:
+            # Задержка создания сокета / гонка: повторяем один раз после резолва
+            if isinstance(addr, tuple) and not _is_ip(addr[0]):
+                host = str(addr[0])
+                ips = _ensure_ips(host)
+                if ips:
+                    return orig(self, (ips[0], addr[1]), *a, **kw)
+            raise
 
-        def getaddrinfo(self, *a, **kw):
-            return patched(*a, **kw)
-
-    yth.socket = _ShimSocket()
-    _dns_probe = {"installed": True, "ips": ips}
-    log(f"YouTube: обход DNS — фиксированные адреса {', '.join(ips[:4])}")
+    socket.getaddrinfo = gai_patched
+    socket.socket.connect = connect_patched
+    log("YouTube: включён обход системного DNS (DoH через прямой TLS к 8.8.8.8)")
 
 
 def _uninstall_dns_shim():
-    if _dns_probe.get("installed"):
+    global _dns_probe
+    st = _dns_probe.get("state")
+    if _dns_probe.get("installed") and st:
+        import socket
         try:
-            import yt_dlp.networking._helper as yth
-            import socket
-            yth.socket = socket
+            if st.get("orig_gai"):
+                socket.getaddrinfo = st["orig_gai"]
+            if st.get("orig_connect"):
+                socket.socket.connect = st["orig_connect"]
         except Exception:
             pass
-        _dns_probe.clear()
+    _dns_probe = {}
 
 
 def _safe_filename(name: str) -> str:
@@ -389,15 +516,18 @@ class DownloadWorker(QThread):
             self.status_changed.emit("Получение информации о видео...")
             _uninstall_dns_shim()  # на случай остаточного состояния после прошлой загрузки
             try:
+                # Обход включаем СРАЗУ, а не после первой ошибки: если системный DNS
+                # сломан (Errno 11001 getaddrinfo failed), первая попытка без шима
+                # обречена, а DoH-резолв внутри шима работает даже при мёртвом резолвере.
+                # Если DNS в порядке — шим прозрачно использует его как обычно.
+                _install_dns_shim()
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(self.url, download=True)
             except yt_dlp.utils.DownloadError as e:
-                # Ошибки сети/DNS (getaddrinfo failed и т.п.) обычно воспроизводятся
-                # повторно — пробуем один раз через DNS-over-HTTPS, минуя системный резолвер.
                 if not self._is_network_error(e):
                     raise
-                log("YouTube: сетевая ошибка, повторяю с обходом системного DNS (DoH)...")
-                self.status_changed.emit("Сетевая ошибка — пробую обойти через DNS-over-HTTPS...")
+                log("YouTube: сетевая ошибка с активным обходом — повторяю попытку...")
+                self.status_changed.emit("Сетевая ошибка — повторная попытка через DNS-over-HTTPS...")
                 _install_dns_shim()
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(self.url, download=True)
