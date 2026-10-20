@@ -16,3 +16,6 @@ pywin32>=306 ; sys_platform == "win32"
 
 # Опционально: ускорение загрузки cookies-обхода для yt-dlp
 # curl_cffi>=0.7
+
+# Модуль "Искатель моментов" (plugins/moment_finder) — собственные алгоритмы
+numpy>=1.26

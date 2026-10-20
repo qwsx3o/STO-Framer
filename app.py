@@ -178,12 +178,17 @@ class StudioWindow(QWidget):
         for plugin in self.plugins:
             if hasattr(plugin, "on_video_ready"):
                 plugin.on_video_ready = self._on_downloaded_video
+            if hasattr(plugin, "set_source"):
+                plugin.set_source(self.input_video)
 
     def _on_downloaded_video(self, path: str):
         """Модуль YouTube успешно скачал видео — делаем его исходным файлом нарезки."""
         self.input_video = path
         self.lbl_file.setText(f"{os.path.basename(path)} (скачано с YouTube)")
         log(f"Скачанный файл подставлен как источник: {path}")
+        for plugin in self.plugins:
+            if hasattr(plugin, "set_source"):
+                plugin.set_source(path)
         self._update_preview()
 
     def _apply_dark_theme(self):
@@ -508,6 +513,9 @@ class StudioWindow(QWidget):
         if path:
             self.input_video = path
             self.lbl_file.setText(os.path.basename(path))
+            for plugin in self.plugins:
+                if hasattr(plugin, "set_source"):
+                    plugin.set_source(path)
             self._update_preview()
 
     def _select_dir(self):
