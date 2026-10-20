@@ -19,7 +19,7 @@ import tempfile
 
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QFrame
+    QFileDialog, QMessageBox, QFrame, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize
 from PySide6.QtGui import (
@@ -44,7 +44,7 @@ class InterestCurveItem(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(96)
-        self.setSizePolicy(self.sizePolicy().Expanding, self.sizePolicy().Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._curve = []                # [(t, v)] нормализованные точки
         self._duration = 1.0
         self.view = (0.0, 1.0)          # (view_start, view_end) сек — общее с таймлайном
