@@ -36,6 +36,110 @@ def _flags():
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
+# ===================================================================== DARK THEME (AE-style)
+# Палитра Adobe After Effects: фон панелей #252525, карточки/дорожки #2d2d2d,
+# канты #1a1a1a/#454545, текст #dedede, акцент янтарный #f6c445.
+AE_QSS = """
+* { outline: none; }
+MomentStudio, MomentStudio > QWidget { background-color: #252525; color: #dedede; }
+QWidget { background-color: transparent; color: #dedede; font-size: 13px; }
+QSplitter::handle { background-color: #1a1a1a; }
+QSplitter::handle:vertical { height: 3px; }
+
+CardWidget { background-color: #2d2d2d; border: 1px solid #1a1a1a; border-radius: 6px; }
+CardWidget QLabel, CardWidget StrongBodyLabel, CardWidget SubtitleLabel,
+CardWidget BodyLabel { color: #dedede; background: transparent; border: none; }
+
+QPushButton { background-color: #3a3a3a; color: #e8e8e8; border: 1px solid #4d4d4d;
+              border-radius: 4px; padding: 6px 14px; }
+QPushButton:hover { background-color: #464646; border-color: #5d5d5d; }
+QPushButton:pressed { background-color: #2f2f2f; }
+QPushButton:disabled { color: #777777; background-color: #333333; border-color: #3d3d3d; }
+
+PrimaryPushButton { background-color: #4b6eaf; color: #ffffff; border: 1px solid #3d5c93; }
+PrimaryPushButton:hover { background-color: #587cbc; }
+PrimaryPushButton:pressed { background-color: #40619e; }
+PrimaryPushButton:disabled { background-color: #3a4a63; color: #9aa7bd; }
+
+TransparentPushButton { background-color: transparent; border: 1px solid #4d4d4d; color: #d0d0d0; }
+TransparentPushButton:hover { background-color: #3a3a3a; }
+
+QListWidget { background-color: #1f1f1f; color: #dedede; border: 1px solid #454545;
+              border-radius: 4px; padding: 2px; }
+QListWidget::item { padding: 7px 8px; border-radius: 3px; color: #dedede; background: transparent; }
+QListWidget::item:hover { background-color: #333333; }
+QListWidget::item:selected { background-color: #44618f; color: #ffffff; }
+
+QScrollBar:vertical { background: #252525; width: 12px; margin: 0; }
+QScrollBar::handle:vertical { background: #4a4a4a; min-height: 26px; border-radius: 5px; }
+QScrollBar::handle:vertical:hover { background: #5a5a5a; }
+QScrollBar:horizontal { background: #252525; height: 12px; margin: 0; }
+QScrollBar::handle:horizontal { background: #4a4a4a; min-width: 26px; border-radius: 5px; }
+QScrollBar::handle:horizontal:hover { background: #5a5a5a; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: none; border: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+
+LineEdit { background-color: #1f1f1f; color: #e8e8e8; border: 1px solid #454545;
+           border-radius: 4px; padding: 4px 8px; selection-background-color: #44618f; }
+LineEdit:hover { border-color: #5a5a5a; }
+LineEdit:focus { border-color: #f6c445; }
+
+SpinBox { background-color: #1f1f1f; color: #e8e8e8; border: 1px solid #454545;
+          border-radius: 4px; padding: 3px 6px; }
+SpinBox:hover { border-color: #5a5a5a; }
+SpinBox:focus { border-color: #f6c445; }
+SpinBox::up-button, SpinBox::down-button { background-color: #3a3a3a; width: 16px; border: none; }
+SpinBox::up-button:hover, SpinBox::down-button:hover { background-color: #4a4a4a; }
+SpinBox::up-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent;
+                    border-bottom: 5px solid #c8c8c8; width: 0; height: 0; }
+SpinBox::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent;
+                      border-top: 5px solid #c8c8c8; width: 0; height: 0; }
+
+QProgressBar { background-color: #1f1f1f; border: 1px solid #454545; border-radius: 4px;
+               text-align: center; color: #dedede; max-height: 16px; }
+QProgressBar::chunk { background-color: #f6c445; border-radius: 3px; }
+
+QToolTip { background-color: #1e1e1e; color: #dedede; border: 1px solid #454545; }
+"""
+
+
+def _ae_palette():
+    """Тёмная палитра AE как QPalette — страховка там, где QSS не покрывает role-цвета."""
+    from PySide6.QtGui import QPalette
+    pal = QPalette()
+    bg = QColor("#252525"); panel = QColor("#2d2d2d"); base = QColor("#1f1f1f")
+    text = QColor("#dedede"); dim = QColor("#8a8a8a")
+    pal.setColor(QPalette.ColorRole.Window, bg)
+    pal.setColor(QPalette.ColorRole.WindowText, text)
+    pal.setColor(QPalette.ColorRole.Base, base)
+    pal.setColor(QPalette.ColorRole.AlternateBase, panel)
+    pal.setColor(QPalette.ColorRole.Text, text)
+    pal.setColor(QPalette.ColorRole.Button, panel)
+    pal.setColor(QPalette.ColorRole.ButtonText, text)
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1e1e1e"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, text)
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#44618f"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, dim)
+    for role in (QPalette.ColorRole.Light, QPalette.ColorRole.Midlight,
+                 QPalette.ColorRole.Dark, QPalette.ColorRole.Mid,
+                 QPalette.ColorRole.Link, QPalette.ColorRole.LinkVisited):
+        pal.setColor(role, QColor("#454545"))
+    return pal
+
+
+def _apply_ae_theme(win):
+    """Тёмная тема только для окна студии (основной интерфейс не затрагивается)."""
+    win.setPalette(_ae_palette())          # до setStyleSheet: Qt применяет QSS поверх палитры
+    win.setAutoFillBackground(True)
+    win.setStyleSheet(AE_QSS)
+    try:
+        from qfluentwidgets import setTheme, Theme
+        setTheme(Theme.DARK)   # иконки FluentIcon и всплывающие InfoBar в тёмном стиле
+    except Exception:
+        pass
+
+
 # ====================================================================== TIMELINE
 class InterestCurveItem(QWidget):
     """Дорожка кривой интересности (как график аудио-волны в AE)."""
@@ -359,6 +463,7 @@ class MomentStudio(QWidget):
         self.duration = 0.0
         self.moments = []
         self._frame_job = None
+        _apply_ae_theme(self)
         self._build_ui()
         if plugin.features_ready(video_path):
             self._load_existing_analysis()
